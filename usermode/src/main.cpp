@@ -8,12 +8,9 @@ int main(int argc, char *argv[]) {
   if (!manager.create("old_but_gold"))
     return -1;
 
-  UNICODE_STRING name;
-  RtlInitUnicodeString(&name, L"ac_client.exe");
-  int pid = driver.get_process_id(name);
-  
-  auto module_base = driver.get_module_base(name);
-
+  const wchar_t *mod_name = L"ac_client.exe";
+  int pid = driver.get_process_id(mod_name);
+  auto module_base = driver.get_module_base(mod_name);
   auto local_player_offset = driver.find_pattern_offset("8B 0D ? ? ? ? 56 57 8B 3D", 2);
   uint32_t local_player = driver.readv<uint32_t>(module_base + local_player_offset);
 
@@ -28,7 +25,6 @@ int main(int argc, char *argv[]) {
 
     int health = driver.readv<int>(local_player + 0xEC);
     std::string player_name = driver.read_str(local_player + 0x205);
-
 
     auto fmt = std::format("Name: {}, Health: {}", player_name.c_str(), health);
     ImGui::GetBackgroundDrawList()->AddText(ImVec2(100, 200), IM_COL32_WHITE, fmt.c_str());

@@ -1,186 +1,177 @@
 #pragma once
 #include "defs.h"
 
-
 class Driver {
-	HANDLE handle = 0;
+  HANDLE handle = 0;
 
-	uintptr_t module_base = 0;
+  uintptr_t module_base = 0;
 
-	unsigned long module_size = AC_MODULE_BASE_SIZE;
+  unsigned long module_size = AC_MODULE_BASE_SIZE;
 
-	int process_id = 0;
+  int process_id = 0;
 
 public:
+  Driver() {
+    void *tmp_handle = CreateFile(L"\\\\.\\acube", GENERIC_WRITE | GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, NULL, NULL);
 
-	Driver() {
-		void* tmp_handle = CreateFile(L"\\\\.\\acube", GENERIC_WRITE | GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, NULL, NULL);
+    if ((long long)tmp_handle == 0xFFFFFFFFFFFFFFFF) { // INVALID_HANDLE_VALUE
+      MessageBox(NULL, L"Failed to open driver connection", L"Error", MB_ICONERROR);
+      exit(0);
+    }
 
-		if ((long long)tmp_handle == 0xFFFFFFFFFFFFFFFF) { // INVALID_HANDLE_VALUE
-			MessageBox(NULL, L"Failed to open driver connection", L"Error", MB_ICONERROR);
-			exit(0);
-		}
+    this->handle = tmp_handle;
+  }
 
-		this->handle = tmp_handle;
-	}
+  ~Driver() { CloseHandle(handle); }
 
-	~Driver() {
-		CloseHandle(handle);
-	}
+  int get_process_id(const wchar_t* process_name) {
+    UNICODE_STRING name{0};
+    RtlInitUnicodeString(&name, process_name);
+    KPROCESSID_REQUEST request = {0};
+    request.process_name = name;
 
-	int get_process_id(UNICODE_STRING process_name) {
+    DWORD bytes_returned;
+    DeviceIoControl(handle, PROCESS_ID_REQUEST, &request, sizeof(request), NULL, NULL, &bytes_returned, NULL);
+    this->process_id = (int)bytes_returned;
 
-		KPROCESSID_REQUEST request = { 0 };
-		request.process_name = process_name;
+    spdlog::info("PID: {}", process_id);
 
-		DWORD bytes_returned;
-		DeviceIoControl(handle, PROCESS_ID_REQUEST, &request, sizeof(request), NULL, NULL, &bytes_returned, NULL);
-		this->process_id = (int)bytes_returned;
-		
-		spdlog::info("PID: {}", process_id);
+    if (!process_id) {
+      MessageBox(NULL, L"Failed to get process ID, check if the process is running", L"Error", MB_ICONERROR);
+      exit(0);
+    }
 
-		if (!process_id) {
-			MessageBox(NULL, L"Failed to get process ID, check if the process is running", L"Error", MB_ICONERROR);
-			exit(0);
-		}
+    return process_id;
+  }
 
+  uintptr_t get_module_base(const wchar_t* module_name) {
+    UNICODE_STRING name{0};
+    RtlInitUnicodeString(&name, module_name);
 
-		return process_id;
-	}
+    KERNEL_MODULE_REQUEST request = {0};
+    request.pid = this->process_id;
+    request.module_name = name;
 
+    DWORD bytes_returned;
+    DeviceIoControl(handle, MODULE_BASE_REQUEST, &request, sizeof(request), NULL, NULL, &bytes_returned, NULL);
+    uintptr_t base = (uintptr_t)bytes_returned;
+    this->module_base = base;
+    spdlog::info("MODULE_BASE: {}", base);
 
-	uintptr_t get_module_base(UNICODE_STRING module_name) {
+    return base;
+  }
 
-		KERNEL_MODULE_REQUEST request = { 0 };
-		request.pid = this->process_id;
-		request.module_name = module_name;
+  template <typename T> T readv(uintptr_t address) {
+    T buffer{0};
+    _KERNEL_READ_REQUEST request = {0};
+    request.src_pid = process_id;
+    request.src_address = (void *)address;
+    request.p_buffer = &buffer;
+    request.size = sizeof(T);
 
-		DWORD bytes_returned;
-		DeviceIoControl(handle, MODULE_BASE_REQUEST, &request, sizeof(request), NULL, NULL, &bytes_returned, NULL);
-		uintptr_t base = (uintptr_t)bytes_returned;
-		this->module_base = base;
-        spdlog::info("MODULE_BASE: {}", base);
-		return base;
-	}
+    DeviceIoControl(handle, READ_REQUEST, &request, sizeof(request), &request, sizeof(request), NULL, NULL);
 
-	template <typename T>
-	T readv(uintptr_t address) {
-		T buffer{ 0 };
-		_KERNEL_READ_REQUEST request = { 0 };
-		request.src_pid = process_id;
-		request.src_address = (void*)address;
-		request.p_buffer = &buffer;
-		request.size = sizeof(T);
+    return buffer;
+  }
 
-		DeviceIoControl(handle, READ_REQUEST, &request, sizeof(request), &request, sizeof(request), NULL, NULL);
+  std::string read_str(uintptr_t address) {
+    static const int length = 64;
+    std::vector<char> buffer(length);
 
+    this->read_raw((void *)address, buffer.data(), length);
 
-		return buffer;
+    const auto &it = find(buffer.begin(), buffer.end(), '\0');
 
-	}
+    if (it != buffer.end())
+      buffer.resize(distance(buffer.begin(), it));
 
-	std::string read_str(uintptr_t address) {
-		static const int length = 64;
-		std::vector<char> buffer(length);
+    return std::string(buffer.begin(), buffer.end());
+  }
 
-		this->read_raw((void*)address, buffer.data(), length);
+  bool read_raw(void *address, void *target, size_t size) {
+    _KERNEL_READ_REQUEST request = {0};
+    request.src_pid = process_id;
+    request.src_address = (void *)address;
+    request.p_buffer = target;
+    request.size = size;
 
-		const auto& it = find(buffer.begin(), buffer.end(), '\0');
+    if (DeviceIoControl(handle, READ_REQUEST, &request, sizeof(request), &request, sizeof(request), NULL, NULL))
+      return true;
 
-		if (it != buffer.end())
-			buffer.resize(distance(buffer.begin(), it));
+    return false;
+  }
 
-		return std::string(buffer.begin(), buffer.end());
-	}
+  std::optional<uint32_t> find_pattern(const std::string_view &pattern, unsigned int byte_offset = 0) {
 
+    const auto module_base = this->module_base;
 
-	bool read_raw(void* address, void* target, size_t size) {
-		_KERNEL_READ_REQUEST request = { 0 };
-		request.src_pid = process_id;
-		request.src_address = (void*)address;
-		request.p_buffer = target;
-		request.size = size;
+    if (!module_base || !module_size)
+      return {};
 
-		if (DeviceIoControl(handle, READ_REQUEST, &request, sizeof(request), &request, sizeof(request), NULL, NULL))
-			return true;
+    const auto module_data = std::make_unique<uint8_t[]>(module_size);
 
-		return false;
-	}
+    if (!this->read_raw((void *)module_base, module_data.get(), module_size))
+      return {};
 
-	std::optional<uint32_t> find_pattern(const std::string_view& pattern, unsigned int byte_offset = 0) {
+    const auto pattern_bytes = this->aob(pattern);
 
+    for (auto i{0}; i < module_size - pattern.size(); ++i) {
+      auto found{true};
 
+      for (auto j{0}; j < pattern_bytes.size(); ++j) {
+        if (module_data[i + j] != pattern_bytes[j] && pattern_bytes[j] != -1) {
+          found = false;
+          break;
+        }
+      }
 
-		const auto module_base = this->module_base;
+      if (found) {
+        auto pattern = module_base + i + byte_offset;
+        spdlog::info("PATTERN_FOUND: at {}", pattern);
+        return pattern;
+      }
+    }
 
-		if (!module_base || !module_size)
-			return {};
+    return {};
+  }
 
-		const auto module_data = std::make_unique<uint8_t[]>(module_size);
+  uint32_t find_pattern_offset(const std::string_view &pattern, unsigned int byte_offset = 0) {
 
-		if (!this->read_raw((void*)module_base, module_data.get(), module_size))
-			return {};
+    const auto signature = this->find_pattern(pattern, byte_offset);
 
-		const auto pattern_bytes = this->aob(pattern);
-
-		for (auto i{ 0 }; i < module_size - pattern.size(); ++i) {
-			auto found{ true };
-
-			for (auto j{ 0 }; j < pattern_bytes.size(); ++j) {
-				if (module_data[i + j] != pattern_bytes[j] && pattern_bytes[j] != -1) {
-					found = false;
-					break;
-				}
-			}
-
-			if (found) {
-                   auto pattern = module_base + i + byte_offset;
-                   spdlog::info("PATTERN_FOUND: at {}", pattern);
-                   return pattern;
-			}
-		}
-
-		return {};
-	}
-
-	uint32_t find_pattern_offset(const std::string_view& pattern, unsigned int byte_offset = 0) {
-
-		const auto signature = this->find_pattern(pattern, byte_offset);
-
-		return this->readv<uint32_t>(signature.value()) - this->module_base;
-
-	}
+    return this->readv<uint32_t>(signature.value()) - this->module_base;
+  }
 
 private:
-	std::vector<int32_t> aob(const std::string_view& pattern) {
-		std::vector<int32_t> bytes;
+  std::vector<int32_t> aob(const std::string_view &pattern) {
+    std::vector<int32_t> bytes;
 
-		for (auto i{ 0 }; i < pattern.size(); ++i) {
-			switch (pattern[i]) {
-			case '?':
-				bytes.push_back(-1);
-				break;
+    for (auto i{0}; i < pattern.size(); ++i) {
+      switch (pattern[i]) {
+      case '?':
+        bytes.push_back(-1);
+        break;
 
-			case ' ':
-				break;
+      case ' ':
+        break;
 
-			default: {
-				if (i + 1 < pattern.size()) {
-					auto value{ 0 };
+      default: {
+        if (i + 1 < pattern.size()) {
+          auto value{0};
 
-					if (const auto [ptr, ec] = std::from_chars(pattern.data() + i, pattern.data() + i + 2, value, 16); ec == std::errc()) {
-						bytes.push_back(value);
-						++i;
-					}
-				}
+          if (const auto [ptr, ec] = std::from_chars(pattern.data() + i, pattern.data() + i + 2, value, 16); ec == std::errc()) {
+            bytes.push_back(value);
+            ++i;
+          }
+        }
 
-				break;
-			}
-			}
-		}
+        break;
+      }
+      }
+    }
 
-		return bytes;
-	}
+    return bytes;
+  }
 };
 
 inline Driver driver;
